@@ -47,7 +47,12 @@ final class HEVCEncoder {
     private let start = CFAbsoluteTimeGetCurrent()
     private func now() -> Double { CFAbsoluteTimeGetCurrent() - start }
 
-    init(width: Int, height: Int, fps: Int, bitrate: Int, prioritizeSpeed: Bool, software: Bool = false, quiet: Bool = false) throws {}
+    let capabilities: EncoderCapabilities
+    enum EncoderError: Error { var capabilities: EncoderCapabilities? { nil } }
+    init(width: Int, height: Int, fps: Int, bitrate: Int, prioritizeSpeed: Bool, mode: EncoderMode, quiet: Bool = false) throws {
+        capabilities = EncoderCapabilities(requestedMode: mode, usingHardware: mode != .software, encoderID: nil,
+                                           gpuRegistryID: nil, propertyStatuses: [:], probeOutcome: .notRun)
+    }
 
     func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
         lock.lock()

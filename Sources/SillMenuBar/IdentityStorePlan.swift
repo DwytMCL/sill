@@ -24,6 +24,12 @@ enum IdentityStoreChoice: Equatable {
 }
 
 enum IdentityStorePlan {
+    /// The local port test bundle must never adopt the installed upstream app's keys or pairings.
+    /// An exact bundle match only; no preference/environment override and no legacy migration.
+    static func keychainService(bundleIdentifier: String?) -> String {
+        bundleIdentifier == "local.sill.amd-test" ? "local.sill.amd-test.remote" : "me.saffer.sill.remote"
+    }
+
     /// The store for this launch (docs/keychain-plan.md §4).
     ///
     /// - `bundled`: running from a `.app` (real Sill.app), not the bare SillMenuBar test binary.

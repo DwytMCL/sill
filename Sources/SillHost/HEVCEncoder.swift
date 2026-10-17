@@ -48,6 +48,9 @@ final class HEVCEncoder {
     let width: Int
     let height: Int
     let software: Bool
+    let mode: EncoderMode
+    private var observed: EncoderCapabilities
+    var capabilities: EncoderCapabilities { lock.lock(); defer { lock.unlock() }; return observed }
     /// A probe's session: no counters and no lines, so a re-check while streaming leaves the
     /// stats line (whose `enc.out` is the menu's encoded fps) and the log as they were.
     let quiet: Bool
@@ -63,6 +66,9 @@ final class HEVCEncoder {
 
     /// Called on VideoToolbox's callback thread with one access unit (length-prefixed NALs).
     var onEncoded: ((_ data: Data, _ isKeyframe: Bool, _ parameterSets: ParameterSets?) -> Void)?
+    /// Local diagnostics only: the same sample whose NAL bytes are forwarded by `onEncoded`.
+    /// Called on the VT callback thread; consumers must return promptly.
+    var onEncodedSample: ((CMSampleBuffer) -> Void)?
     /// The session stopped returning frames. Called once, on the watchdog's queue. The encoder is
     /// dead afterwards: it drops every further frame.
     var onHung: (() -> Void)?
@@ -99,7 +105,7 @@ final class HEVCEncoder {
     /// frame never meets the rule.
     private var slowState: EncoderSlowState?
     /// A new session, made and prepared, that the next frame handed over goes into.
-    private var replacement: VTCompressionSession?
+    private var replacement: (session: VTCompressionSession, capabilities: EncoderCapabilities)?
 
     private let encodeQueue = DispatchQueue(label: "sill.encode", qos: .userInteractive)
     /// The watchdog must not share `encodeQueue`: when VideoToolbox hangs, it hangs *inside*
@@ -123,19 +129,31 @@ final class HEVCEncoder {
         return n != 0
     }()
 
-    init(width: Int, height: Int, fps: Int, bitrate: Int, prioritizeSpeed: Bool, software: Bool = false,
+    /// Compatibility entry point until the coordinator adopts the explicit mode hook.
+    convenience init(width: Int, height: Int, fps: Int, bitrate: Int, prioritizeSpeed: Bool, software: Bool = false,
+                     quiet: Bool = false) throws {
+        try self.init(width: width, height: height, fps: fps, bitrate: bitrate, prioritizeSpeed: prioritizeSpeed,
+                      mode: software ? .software : .auto, quiet: quiet)
+    }
+
+    init(width: Int, height: Int, fps: Int, bitrate: Int, prioritizeSpeed: Bool, mode: EncoderMode,
          quiet: Bool = false) throws {
+        let made = try Self.makeSession(width: width, height: height, fps: fps, bitrate: bitrate,
+                                        prioritizeSpeed: prioritizeSpeed, mode: mode)
         self.width = width
         self.height = height
-        self.software = software
+        self.mode = mode
+        self.software = mode == .software || mode == .softwareRequested || made.capabilities.usingHardware == false
         self.quiet = quiet
         self.fps = fps
         self.bitrate = bitrate
         self.prioritizeSpeed = prioritizeSpeed
+        self.observed = made.capabilities
+        self.session = made.session
         Self.serialLock.lock(); Self.lastSerial += 1; serial = Self.lastSerial; Self.serialLock.unlock()
-        session = try Self.makeSession(width: width, height: height, fps: fps, bitrate: bitrate, prioritizeSpeed: prioritizeSpeed,
-                                       software: software)
-        if !software, !quiet, Self.replacingSlowSessions { slowState = EncoderSlowState(now: CACurrentMediaTime()) }
+        if made.capabilities.usingHardware == true, !quiet, Self.replacingSlowSessions {
+            slowState = EncoderSlowState(now: CACurrentMediaTime())
+        }
 
         let t = DispatchSource.makeTimerSource(queue: watchdogQueue)
         t.schedule(deadline: .now() + 0.5, repeating: 0.5, leeway: .milliseconds(100))
@@ -144,36 +162,85 @@ final class HEVCEncoder {
         watchdog = t
     }
 
-    /// A session with this encoder's settings, ready for its first frame: the stream's first, and
-    /// each one that replaces a session settled in the slow state.
+    /// A session ready for its first frame, with every attempted operation retained. Required
+    /// format/latency properties fail closed; unsupported rate/speed tuning remains diagnostic.
     private static func makeSession(width: Int, height: Int, fps: Int, bitrate: Int, prioritizeSpeed: Bool,
-                                    software: Bool) throws -> VTCompressionSession {
+                                    mode: EncoderMode) throws -> (session: VTCompressionSession, capabilities: EncoderCapabilities) {
+        var c = EncoderCapabilities(requestedMode: mode, usingHardware: nil, encoderID: nil, gpuRegistryID: nil,
+                                    propertyStatuses: [:], probeOutcome: .notRun)
+        guard width > 0, height > 0, width % 2 == 0, height % 2 == 0,
+              width <= Int32.max, height <= Int32.max, fps > 0, fps <= Int32.max / 4, bitrate > 0 else {
+            throw EncoderError.invalidConfiguration
+        }
         var s: VTCompressionSession?
         var spec: [CFString: Any] = [:]
-        if software { spec[kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder] = false }
+        switch mode {
+        case .auto: spec[kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder] = true
+        case .hardware: spec[kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder] = true
+        case .software, .softwareRequested: spec[kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder] = false
+        }
         let status = VTCompressionSessionCreate(
             allocator: nil, width: Int32(width), height: Int32(height),
-            codecType: kCMVideoCodecType_HEVC, encoderSpecification: spec.isEmpty ? nil : spec as CFDictionary,
+            codecType: kCMVideoCodecType_HEVC, encoderSpecification: spec as CFDictionary,
             imageBufferAttributes: nil, compressedDataAllocator: nil,
             outputCallback: nil, refcon: nil, compressionSessionOut: &s)
-        guard status == noErr, let session = s else { throw EncoderError.create(status) }
-
-        func set(_ key: CFString, _ value: CFTypeRef) { VTSessionSetProperty(session, key: key, value: value) }
-        set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
-        set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel)
-        set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)      // no B-frames
-        // Keyframes are requested on demand (new client, dropped delta, source switch); this is
-        // only a safety interval. Longer intervals cut the periodic IDR hitch; 4 s is the value
-        // every working stream so far has used.
-        set(kVTCompressionPropertyKey_MaxKeyFrameInterval, (fps * 4) as CFNumber)
-        set(kVTCompressionPropertyKey_ExpectedFrameRate, fps as CFNumber)
-        set(kVTCompressionPropertyKey_AverageBitRate, bitrate as CFNumber)
-        set(kVTCompressionPropertyKey_DataRateLimits, [bitrate / 8, 1] as CFArray)
-        if prioritizeSpeed || software, #available(macOS 14.0, *) {
-            set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue)
+        c.propertyStatuses["create"] = status
+        guard status == noErr, let session = s else {
+            if let s { retire(s) }
+            c.probeOutcome = status == kVTCouldNotFindVideoEncoderErr || status == kVTVideoEncoderNotAvailableNowErr ? .unsupported : .failed
+            throw EncoderError.operation("create", status, c)
         }
-        VTCompressionSessionPrepareToEncodeFrames(session)
-        return session
+        do {
+            func set(_ key: CFString, _ value: CFTypeRef, required: Bool = false) throws {
+                let result = VTSessionSetProperty(session, key: key, value: value)
+                c.propertyStatuses["set.\(key)"] = result
+                let stopOnFailure = required
+                if stopOnFailure, result != noErr {
+                    c.probeOutcome = .failed
+                    throw EncoderError.operation("set.\(key)", result, c)
+                }
+            }
+            try set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue, required: true)
+            try set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel, required: true)
+            try set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, required: true)
+            // On-demand keyframes and the existing four-second safety interval are unchanged.
+            try set(kVTCompressionPropertyKey_MaxKeyFrameInterval, (fps * 4) as CFNumber)
+            try set(kVTCompressionPropertyKey_ExpectedFrameRate, fps as CFNumber)
+            try set(kVTCompressionPropertyKey_AverageBitRate, bitrate as CFNumber)
+            try set(kVTCompressionPropertyKey_DataRateLimits, [bitrate / 8, 1] as CFArray)
+            if prioritizeSpeed || mode == .software || mode == .softwareRequested {
+                try set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue)
+            }
+            let prepared = VTCompressionSessionPrepareToEncodeFrames(session)
+            c.propertyStatuses["prepare"] = prepared
+            guard prepared == noErr else {
+                c.probeOutcome = .failed
+                throw EncoderError.operation("prepare", prepared, c)
+            }
+            func read(_ key: CFString) -> CFTypeRef? {
+                var value: Unmanaged<CFTypeRef>?
+                let result = VTSessionCopyProperty(session, key: key, allocator: nil, valueOut: &value)
+                let copied = value?.takeRetainedValue()
+                c.propertyStatuses["copy.\(key)"] = result
+                return result == noErr ? copied : nil
+            }
+            if let value = read(kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder),
+               CFGetTypeID(value) == CFBooleanGetTypeID() { c.usingHardware = (value as! NSNumber).boolValue }
+            c.encoderID = read(kVTCompressionPropertyKey_EncoderID) as? String
+            if let value = read(kVTCompressionPropertyKey_UsingGPURegistryID), CFGetTypeID(value) == CFNumberGetTypeID() {
+                let id = (value as! NSNumber).uint64Value
+                c.gpuRegistryID = id == 0 ? nil : id
+            }
+            if (mode == .hardware && c.usingHardware != true) || (mode == .software && c.usingHardware != false)
+                || (mode == .softwareRequested && c.usingHardware == true) {
+                c.probeOutcome = .unsupported
+                throw EncoderError.selection(c)
+            }
+            return (session, c)
+        } catch {
+            retire(session)
+            throw error
+        }
     }
 
     /// The watchdog gave up on this session. The owner checks this after installing an encoder,
@@ -188,13 +255,13 @@ final class HEVCEncoder {
     func abandon() -> Bool {
         lock.lock(); let inside = mailbox.giveUp(); lastFrame = nil; let spare = replacement; replacement = nil; lock.unlock()
         watchdog?.cancel()
-        if let spare { Self.retire(spare) }
+        if let spare { Self.retire(spare.session) }
         return inside
     }
 
     deinit {
         watchdog?.cancel()
-        if let spare = replacement { Self.retire(spare) }   // made for the slow state, never used
+        if let spare = replacement { Self.retire(spare.session) }   // made for the slow state, never used
         guard let session else { return }
         lock.lock()
         // Drain a live session with a frame let in. One given up on with a frame inside VideoToolbox
@@ -203,7 +270,7 @@ final class HEVCEncoder {
         let teardown = mailbox.teardown
         let report = hungReported && !quiet
         lock.unlock()
-        let described = "\(software ? "software" : "hardware") HEVC \(width)×\(height)"
+        let described = description
         let back = onStalledFrameBack
         // Never tear a live session down with a frame still inside the hardware encoder. The system
         // log for 2026-09-22 shows every wedge began with a session whose first frame never came
@@ -304,7 +371,11 @@ final class HEVCEncoder {
             // to the next requestKeyframe, or a retry after a dropped keyframe would do nothing.
             if fromCapture { lastFrameAt = now }
         }
-        if case .goesIn(let id) = admission { encodeQueue.async { [weak self] in self?.submit(pixelBuffer, pts: pts, id: id) } }
+        if case .goesIn(let id) = admission {
+            encodeQueue.async { [weak self] in
+                self?.submit(pixelBuffer, pts: pts, id: id)
+            }
+        }
         return admission
     }
 
@@ -327,7 +398,9 @@ final class HEVCEncoder {
     /// encodeQueue: frames go into VideoToolbox one after another, in the order they were let in,
     /// one inside at a time (`EncoderMailbox`).
     private func submit(_ pixelBuffer: CVPixelBuffer, pts requested: CMTime, id: Int) {
-        guard var session else { return }
+        guard var session else {
+            return
+        }
         lock.lock()
         let now = CACurrentMediaTime()
         let handOver = mailbox.handOver(id, pts: requested, now: now)
@@ -337,12 +410,15 @@ final class HEVCEncoder {
         if handOver != nil, let next = replacement {
             replacement = nil
             retired = session
-            session = next
-            self.session = next
+            session = next.session
+            self.session = next.session
+            observed = next.capabilities
             slowState?.swapped(at: now)
         }
         lock.unlock()
-        guard let handOver else { return }   // a frame queued just before the watchdog gave up
+        guard let handOver else {
+            return
+        }   // a frame queued just before the watchdog gave up
         if let retired {
             // The old session's last output may not have reached `onEncoded` yet: its handler let
             // this frame in (`frameReturned`) before handing its own frame on (`handle`), and the new
@@ -363,14 +439,15 @@ final class HEVCEncoder {
         let pts = handOver.pts
 
         if testHoldEachFrame > 0 { Thread.sleep(forTimeInterval: testHoldEachFrame) }
-        if id == TestHang.frame, !quiet, !software, TestHang.take() {
+        if id == TestHang.frame, !quiet, capabilities.usingHardware == true, TestHang.take() {
             // TEST ONLY (SILL_TEST_ENCODER_HANG): this frame waits here, then goes in late and comes
             // back, as frames did in a busy engine on 2026-09-24. The watchdog fires meanwhile.
             print("TEST: holding frame \(id) of the hardware HEVC \(width)×\(height) session for \(Int(TestHang.hold)) s before it goes in (SILL_TEST_ENCODER_HANG)")
             Thread.sleep(forTimeInterval: TestHang.hold)
         }
+        let traceFlags: UnsafeMutablePointer<VTEncodeInfoFlags>? = nil
         let status = VTCompressionSessionEncodeFrame(session, imageBuffer: pixelBuffer, presentationTimeStamp: pts,
-                                                     duration: .invalid, frameProperties: props, infoFlagsOut: nil) { [weak self] status, _, sampleBuffer in
+                                                     duration: .invalid, frameProperties: props, infoFlagsOut: traceFlags) { [weak self] status, flags, sampleBuffer in
             guard let self else { return }
             // A session the watchdog gave up on may still cough up late output. Its clients have
             // moved on to a new session (new size, new parameter sets): never forward it.
@@ -378,6 +455,7 @@ final class HEVCEncoder {
             guard self.frameReturned(id, bytes: bytes) else { return }
             guard status == noErr, let sampleBuffer else {
                 self.bump("enc.error")
+                self.lock.lock(); self.observed.propertyStatuses["encode.output"] = status; self.lock.unlock()
                 // VideoToolbox dropped the frame (real-time mode over its data-rate cap). A forced
                 // keyframe must not go with it: on a static window nothing would ask again and a
                 // client waiting for a keyframe would wait for good.
@@ -387,9 +465,20 @@ final class HEVCEncoder {
             self.bump("enc.out")
             self.handle(sampleBuffer)
         }
+#if arch(x86_64)
+        // An Intel/AMD Mac's hardware HEVC encoder holds about six frames before it returns the
+        // first (measured 2026-10-18 on a Radeon RX 6600: 200 ms and six frames in), so with one
+        // frame inside it never returns any and the watchdog calls it a hang. Completing each
+        // frame as it goes returns every one: 90 of 90 at 1080p30, 5 ms median, the call ~10 ms.
+        // Apple silicon returns frames unasked and never takes this path.
+        if status == noErr, mode != .software, mode != .softwareRequested {
+            VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: pts)
+        }
+#endif
         if status != noErr {
             // Refused outright; the handler may never run. Free the slot ourselves, or the watchdog
             // would call a transient error a hang and drop the stream to the software encoder.
+            lock.lock(); observed.propertyStatuses["encode.submit"] = status; lock.unlock()
             bump("enc.refused")
             if forced { retryKeyframe() }
             frameReturned(id, bytes: nil)
@@ -420,7 +509,11 @@ final class HEVCEncoder {
         }
         let outcome = mailbox.returned(id, now: now)
         // Queued before the lock is released, like every frame let in (`admitLocked`).
-        if case .next(let (pb, pts), let next) = outcome { encodeQueue.async { [weak self] in self?.submit(pb, pts: pts, id: next) } }
+        if case .next(let (pb, pts), let next) = outcome {
+            encodeQueue.async { [weak self] in
+                self?.submit(pb, pts: pts, id: next)
+            }
+        }
         lock.unlock()
         if let event { slowStateSays(event) }
         switch outcome {
@@ -434,15 +527,15 @@ final class HEVCEncoder {
     private func checkWatchdog() {
         lock.lock()
         let hung = mailbox.giveUpIfHung(now: CACurrentMediaTime(), after: Self.hangAfter)
-        var spare: VTCompressionSession?
+        var spare: (session: VTCompressionSession, capabilities: EncoderCapabilities)?
         if hung { hungReported = true; lastFrame = nil; spare = replacement; replacement = nil }   // lastFrame: 8+ MB at Retina size, no longer needed
         lock.unlock()
         guard hung else { return }
-        if let spare { Self.retire(spare) }
+        if let spare { Self.retire(spare.session) }
         watchdog?.cancel()
         bump("enc.hung")
         if !quiet {
-            print("Encoder (\(software ? "software" : "hardware") HEVC \(width)×\(height)) returned nothing for \(Int(Self.hangAfter * 1000)) ms: giving up on this session")
+            print("Encoder (\(description)) returned nothing for \(Int(Self.hangAfter * 1000)) ms: giving up on this session")
         }
         onHung?()
     }
@@ -452,7 +545,7 @@ final class HEVCEncoder {
     private func slowStateSays(_ event: EncoderSlowState.Event) {
         switch event {
         case .replace: makeReplacement()
-        case .judged(let report): print(Self.describe(report, session: "hardware HEVC \(width)×\(height)"))
+        case .judged(let report): print(Self.describe(report, session: description))
         }
     }
 
@@ -460,15 +553,17 @@ final class HEVCEncoder {
     /// on (making one takes tens of ms, which must count against no frame's clock); `submit` hands
     /// the next frame to it. One that cannot be made leaves the stream on the old one.
     private func makeReplacement() {
-        let (w, h, fps, bitrate, speed) = (width, height, fps, bitrate, prioritizeSpeed)
+        let (w, h, fps, bitrate, speed, mode) = (width, height, fps, bitrate, prioritizeSpeed, mode)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let made = try? HEVCEncoder.makeSession(width: w, height: h, fps: fps, bitrate: bitrate, prioritizeSpeed: speed, software: false)
-            guard let self else { if let made { HEVCEncoder.retire(made) }; return }
+            let made: (session: VTCompressionSession, capabilities: EncoderCapabilities)?
+            do { made = try HEVCEncoder.makeSession(width: w, height: h, fps: fps, bitrate: bitrate, prioritizeSpeed: speed, mode: mode) }
+            catch { print("Encoder replacement failed: \(error)"); made = nil }
+            guard let self else { if let made { HEVCEncoder.retire(made.session) }; return }
             self.lock.lock()
-            let taken = made != nil && !self.mailbox.dead
+            let taken = made?.capabilities.usingHardware == true && !self.mailbox.dead
             if taken { self.replacement = made } else { self.slowState?.replacementFailed(at: CACurrentMediaTime()) }
             self.lock.unlock()
-            if !taken, let made { HEVCEncoder.retire(made) }
+            if !taken, let made { HEVCEncoder.retire(made.session) }
         }
     }
 
@@ -519,6 +614,7 @@ final class HEVCEncoder {
             CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: raw.baseAddress!)
         }
         guard copied == noErr else { return }
+        onEncodedSample?(sb)
         onEncoded?(data, isKey, ps)
     }
 
@@ -540,7 +636,24 @@ final class HEVCEncoder {
         return ParameterSets(nalUnitHeaderLength: Int(nalLen), sets: sets)
     }
 
-    enum EncoderError: Error { case create(OSStatus) }
+    var description: String {
+        let c = capabilities
+        let backend = c.usingHardware.map { $0 ? "hardware" : "software" } ?? "unknown backend"
+        return "\(backend) HEVC \(width)×\(height)"
+    }
+
+    enum EncoderError: Error {
+        case invalidConfiguration
+        case operation(String, OSStatus, EncoderCapabilities)
+        case selection(EncoderCapabilities)
+
+        var capabilities: EncoderCapabilities? {
+            switch self {
+            case .invalidConfiguration: return nil
+            case .operation(_, _, let c), .selection(let c): return c
+            }
+        }
+    }
 
     /// TEST ONLY. `SILL_TEST_ENCODER_HANG=N`: the first N hardware stream sessions of this process
     /// each hold their 90th frame on `encodeQueue` for 3 s before handing it to VideoToolbox (later

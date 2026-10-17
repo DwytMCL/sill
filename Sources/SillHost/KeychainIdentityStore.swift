@@ -20,7 +20,8 @@ import Security
 ///   profile embedded in the build (Scripts/make-app.sh --release, docs/release-checklist.md);
 ///   IdentityStorePlan picks it only when the running binary actually holds the entitlement.
 ///
-/// The items, in either keychain:
+/// The items, in either keychain (upstream names by default; the local AMD test bundle passes
+/// `local.sill.amd-test.remote` as its service and derives its key tag from that service):
 /// - The key: a permanent P-256 private key, application tag `me.saffer.sill.remote.host-key`,
 ///   label "Sill Remote Access", looked up by its tag. Only the private key is stored; the public
 ///   one is derived from it.
@@ -58,9 +59,9 @@ import Security
 /// (the same posture as the iOS device key, WhenUnlockedThisDeviceOnly). The legacy store keeps the
 /// login keychain's own default, as it always did.
 package final class KeychainIdentityStore: IdentityStore {
-    static let keyTag = Data("me.saffer.sill.remote.host-key".utf8)
-    static let label = "Sill Remote Access"
-    static let service = "me.saffer.sill.remote"
+    var keyTag: Data { Data("\(service).host-key".utf8) }
+    var label: String { service == "me.saffer.sill.remote" ? "Sill Remote Access" : "Sill AMD Test Remote Access" }
+    let service: String
     static let recognitionAccount = "recognition-key"
     static let pairedAccount = "paired-devices"
     static let requirePairingAccount = "require-pairing"
@@ -70,7 +71,12 @@ package final class KeychainIdentityStore: IdentityStore {
     private var dataProtection: Bool { accessGroup != nil }
 
     /// `accessGroup` nil is the legacy login keychain; a group name is the data-protection keychain.
-    package init(accessGroup: String? = nil) { self.accessGroup = accessGroup }
+    /// Service and private-key tag change together: bundle ID alone does not isolate Keychain.
+    /// No migration or fallback to another service, including on an unreadable item.
+    package init(accessGroup: String? = nil, service: String = "me.saffer.sill.remote") {
+        self.accessGroup = accessGroup
+        self.service = service
+    }
 
     package var summary: String {
         guard let accessGroup else { return "in the login keychain" }
@@ -95,7 +101,7 @@ package final class KeychainIdentityStore: IdentityStore {
     package func loadOrCreateKey() throws -> SecKey {
         var query: [String: Any] = [
             kSecClass as String: kSecClassKey,
-            kSecAttrApplicationTag as String: Self.keyTag,
+            kSecAttrApplicationTag as String: keyTag,
             kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
             kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
             kSecMatchLimit as String: kSecMatchLimitOne,
@@ -117,8 +123,8 @@ package final class KeychainIdentityStore: IdentityStore {
             kSecAttrKeySizeInBits as String: 256,
             kSecPrivateKeyAttrs as String: [
                 kSecAttrIsPermanent as String: true,
-                kSecAttrApplicationTag as String: Self.keyTag,
-                kSecAttrLabel as String: Self.label,
+                kSecAttrApplicationTag as String: keyTag,
+                kSecAttrLabel as String: label,
             ] as [String: Any],
         ]
         if let accessGroup {
@@ -146,7 +152,7 @@ package final class KeychainIdentityStore: IdentityStore {
             return data
         }
         let data = try MemoryIdentityStore.randomBytes(32)
-        try write(data, account: Self.recognitionAccount, label: "\(Self.label) (recognition key)")
+        try write(data, account: Self.recognitionAccount, label: "\(label) (recognition key)")
         return data
     }
 
@@ -166,7 +172,7 @@ package final class KeychainIdentityStore: IdentityStore {
     package func savePaired(_ devices: [PairedDevice]) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        try write(try encoder.encode(devices), account: Self.pairedAccount, label: "\(Self.label) (paired devices)")
+        try write(try encoder.encode(devices), account: Self.pairedAccount, label: "\(label) (paired devices)")
     }
 
     package func loadRequirePairing() throws -> Data? {
@@ -174,7 +180,7 @@ package final class KeychainIdentityStore: IdentityStore {
     }
 
     package func saveRequirePairing(_ record: Data) throws {
-        try write(record, account: Self.requirePairingAccount, label: "\(Self.label) (require pairing)")
+        try write(record, account: Self.requirePairingAccount, label: "\(label) (require pairing)")
     }
 
     // MARK: Generic passwords
@@ -185,7 +191,7 @@ package final class KeychainIdentityStore: IdentityStore {
     private func read(_ account: String) throws -> Data? {
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.service,
+            kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecMatchLimit as String: kSecMatchLimitOne,
             kSecReturnData as String: true,
@@ -203,7 +209,7 @@ package final class KeychainIdentityStore: IdentityStore {
     private func write(_ data: Data, account: String, label: String) throws {
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.service,
+            kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
         query.merge(scope()) { _, new in new }

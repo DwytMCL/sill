@@ -50,6 +50,7 @@ var probeSeqNow: Int { probeSeqLock.run { probeSeq } }
 @discardableResult
 func CVPixelBufferCreate(_ allocator: CFAllocator?, _ width: Int, _ height: Int, _ format: OSType, _ attrs: CFDictionary?,
                          _ out: UnsafeMutablePointer<CVPixelBuffer?>) -> CVReturn {
+    if FakeVT.lock.run({ FakeVT.pixelBufferFailure }) { return kCVReturnAllocationFailed }
     let r = CoreVideo.CVPixelBufferCreate(allocator, width, height, format, attrs, out)
     if r == kCVReturnSuccess, let b = out.pointee {
         let s = probeSeqLock.run { probeSeq += 1; return probeSeq }
@@ -62,6 +63,12 @@ func CVPixelBufferCreate(_ allocator: CFAllocator?, _ width: Int, _ height: Int,
 
 /// What the stand-in does with one encode call.
 enum Behavior {
+    // Pair-gated fake compressor: first output needs a second native input; no flush.
+    case untilSecond(reverse: Bool)
+    case duplicate
+    case inlineThenHold(Double)
+    /// Diagnostic stage checks: invoke callback inline, before the submit function returns.
+    case inline(status: OSStatus, sample: Bool, flags: UInt32)
     /// Accepted; its output comes this long after the call (on a serial engine, this long after the
     /// frame before it is done), never before an earlier frame's (decode order).
     case returnAfter(Double)
@@ -103,6 +110,17 @@ enum FakeVT {
     /// How long VTCompressionSessionCreate takes (a new session for the slow state is made off every
     /// queue of the encoder's, so this delays only its taking over).
     static var createDelay: Double = 0
+    static var delayReadback: Int? = -1
+    static var delaySets: [Int] = []
+    static var submitFlags: UInt32 = 0
+    static var pixelBufferFailure = false
+    static var createStatus: OSStatus = noErr
+    static var prepareStatus: OSStatus = noErr
+    static var setStatuses: [String: OSStatus] = [:]
+    static var copyStatuses: [String: OSStatus] = [:]
+    static var readHardware = true
+    static var forcedReadback: Bool?
+    static var specifications: [NSDictionary] = []
     /// Called on a session's callback queue just before and just after it runs an output handler,
     /// with the session's number (the delivery-order case of E7 holds a handler with `Inject`).
     static var beforeHandler: ((Int) -> Void)?
@@ -114,6 +132,8 @@ enum FakeVT {
         lock.run {
             plan = p; serialEngine = serial; calls = []; outputs = []; maxHeld = [:]; invalidated = [:]; createDelay = 0
             beforeHandler = nil; afterHandler = nil
+            delayReadback = -1; delaySets = []; submitFlags = 0; pixelBufferFailure = false; createStatus = noErr; prepareStatus = noErr; setStatuses = [:]; copyStatuses = [:]
+            readHardware = true; forcedReadback = nil; specifications = []
         }
     }
     static func newSession() -> Int { lock.run { sessionCount += 1; return sessionCount } }
@@ -135,6 +155,7 @@ final class VTCompressionSession {
     private var callCount = 0
     /// Frames accepted and not out yet, by call number: the surfaces this "encoder" holds.
     private var held: [Int: CVPixelBuffer] = [:]
+    private var gated: [(CMTime, Bool, VTCompressionOutputHandler)] = []
     private var lastDue: CFTimeInterval = 0
     private var engineFree: CFTimeInterval = 0
     private var invalid = false
@@ -157,6 +178,28 @@ final class VTCompressionSession {
         let behavior = FakeVT.lock.run { FakeVT.plan(index, n, seq, software) }
         var call = Call(session: index, n: n, seq: seq, pts: pts, forced: forced, at: now)
         switch behavior {
+        case .untilSecond(let reverse):
+            FakeVT.lock.run { FakeVT.calls.append(call) }
+            let pair = lock.run { () -> [(CMTime, Bool, VTCompressionOutputHandler)] in
+                gated.append((pts, forced || n == 1, handler))
+                guard gated.count == 2 else { return [] }
+                defer { gated.removeAll() }; return gated
+            }
+            let ordered = reverse ? Array(pair.reversed()) : pair
+            for (stamp, key, output) in ordered { output(0, [], Self.sample(session: index, call: n, pts: stamp, key: key)) }
+            return 0
+        case .inlineThenHold(let delay):
+            FakeVT.lock.run { FakeVT.calls.append(call) }
+            handler(0, [], Self.sample(session: index, call: n, pts: pts, key: forced || n == 1))
+            Thread.sleep(forTimeInterval: delay); return 0
+        case .duplicate:
+            FakeVT.lock.run { FakeVT.calls.append(call) }
+            let sample = Self.sample(session: index, call: n, pts: pts, key: forced || n == 1)
+            handler(0, [], sample); handler(0, [], sample); return 0
+        case .inline(let status, let sample, let flags):
+            FakeVT.lock.run { FakeVT.calls.append(call) }
+            handler(status, VTEncodeInfoFlags(rawValue: flags), sample ? Self.sample(session: index, call: n, pts: pts, key: forced || n == 1) : nil)
+            return noErr
         case .refuse(let after):
             if after > 0 { Thread.sleep(forTimeInterval: after) }
             call.refused = true
@@ -242,7 +285,7 @@ final class VTCompressionSession {
 
 // MARK: - The VideoToolbox names HEVCEncoder.swift uses
 
-struct VTEncodeInfoFlags: OptionSet { let rawValue: UInt32; init(rawValue: UInt32) { self.rawValue = rawValue } }
+struct VTEncodeInfoFlags: OptionSet { let rawValue: UInt32; init(rawValue: UInt32) { self.rawValue = rawValue }; static let frameDropped = VTEncodeInfoFlags(rawValue: 2) }
 typealias VTCompressionOutputHandler = (OSStatus, VTEncodeInfoFlags, CMSampleBuffer?) -> Void
 
 @discardableResult
@@ -253,18 +296,51 @@ func VTCompressionSessionCreate(allocator: CFAllocator?, width: Int32, height: I
                                 compressionSessionOut: UnsafeMutablePointer<VTCompressionSession?>) -> OSStatus {
     let spec = encoderSpecification as NSDictionary?
     let software = (spec?[kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder as String] as? Bool) == false
-    let delay = FakeVT.lock.run { FakeVT.createDelay }
+    let (delay, status) = FakeVT.lock.run { () -> (Double, OSStatus) in
+        FakeVT.specifications.append(spec ?? [:])
+        return (FakeVT.createDelay, FakeVT.createStatus)
+    }
+    guard status == noErr else { return status }
     if delay > 0 { Thread.sleep(forTimeInterval: delay) }
     compressionSessionOut.pointee = VTCompressionSession(software: software)
     return noErr
 }
-@discardableResult func VTSessionSetProperty(_ session: VTCompressionSession, key: CFString, value: CFTypeRef?) -> OSStatus { noErr }
-@discardableResult func VTCompressionSessionPrepareToEncodeFrames(_ session: VTCompressionSession) -> OSStatus { noErr }
+@discardableResult func VTSessionSetProperty(_ session: VTCompressionSession, key: CFString, value: CFTypeRef?) -> OSStatus {
+    FakeVT.lock.run {
+        let status = FakeVT.setStatuses[key as String] ?? noErr
+        if key == kVTCompressionPropertyKey_MaxFrameDelayCount, status == noErr, let number = value as? NSNumber {
+            FakeVT.delaySets.append(number.intValue)
+            if FakeVT.delayReadback != nil { FakeVT.delayReadback = number.intValue }
+        }
+        return status
+    }
+}
+@discardableResult func VTCompressionSessionPrepareToEncodeFrames(_ session: VTCompressionSession) -> OSStatus {
+    FakeVT.lock.run { FakeVT.prepareStatus }
+}
+func VTSessionCopyProperty(_ session: VTCompressionSession, key: CFString, allocator: CFAllocator?, valueOut: UnsafeMutableRawPointer) -> OSStatus {
+    FakeVT.lock.run {
+        let status = FakeVT.copyStatuses[key as String] ?? noErr
+        guard status == noErr else { return status }
+        var value: CFTypeRef?
+        switch key {
+        case kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder:
+            if FakeVT.readHardware { value = (FakeVT.forcedReadback ?? !session.software) ? kCFBooleanTrue : kCFBooleanFalse }
+        case kVTCompressionPropertyKey_MaxFrameDelayCount: value = FakeVT.delayReadback.map { $0 as CFNumber }
+        case kVTCompressionPropertyKey_EncoderID: value = "fake.encoder" as CFString
+        case kVTCompressionPropertyKey_UsingGPURegistryID: value = 42 as CFNumber
+        default: return -12900
+        }
+        valueOut.assumingMemoryBound(to: Unmanaged<CFTypeRef>?.self).pointee = value.map { Unmanaged.passRetained($0) }
+        return noErr
+    }
+}
 func VTCompressionSessionEncodeFrame(_ session: VTCompressionSession, imageBuffer: CVImageBuffer, presentationTimeStamp: CMTime,
                                      duration: CMTime, frameProperties: CFDictionary?,
                                      infoFlagsOut: UnsafeMutablePointer<VTEncodeInfoFlags>?,
                                      outputHandler: @escaping VTCompressionOutputHandler) -> OSStatus {
-    session.encode(imageBuffer, pts: presentationTimeStamp, props: frameProperties, handler: outputHandler)
+    infoFlagsOut?.pointee = VTEncodeInfoFlags(rawValue: FakeVT.lock.run { FakeVT.submitFlags })
+    return session.encode(imageBuffer, pts: presentationTimeStamp, props: frameProperties, handler: outputHandler)
 }
 @discardableResult
 func VTCompressionSessionCompleteFrames(_ session: VTCompressionSession, untilPresentationTimeStamp: CMTime) -> OSStatus {
@@ -337,3 +413,20 @@ enum Inject {
         method_setImplementation(m, imp_implementationWithBlock(block))
     }
 }
+
+let kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder = "RequireHardwareAcceleratedVideoEncoder" as CFString
+let kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder = "UsingHardwareAcceleratedVideoEncoder" as CFString
+let kVTCompressionPropertyKey_EncoderID = "EncoderID" as CFString
+let kVTCompressionPropertyKey_UsingGPURegistryID = "UsingGPURegistryID" as CFString
+let kVTCouldNotFindVideoEncoderErr: OSStatus = -12908
+let kVTVideoEncoderNotAvailableNowErr: OSStatus = -12915
+
+let kVTPropertyNotSupportedErr: OSStatus = -12900
+
+let kVTCompressionPropertyKey_MaxFrameDelayCount = "MaxFrameDelayCount" as CFString
+func VTSessionCopySupportedPropertyDictionary(_ session: VTCompressionSession, supportedPropertyDictionaryOut: UnsafeMutablePointer<CFDictionary?>) -> OSStatus {
+    supportedPropertyDictionaryOut.pointee = ["MaxFrameDelayCount": ["Type": "Number", "ReadWriteStatus": "ReadWrite"]] as CFDictionary
+    return noErr
+}
+
+let kVTVideoEncoderSpecification_EnableLowLatencyRateControl = "EnableLowLatencyRateControl" as CFString

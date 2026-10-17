@@ -1,5 +1,10 @@
 # Sill
 
+> **This fork runs the Mac side of Sill on Intel and AMD Macs (x86_64).** It is
+> [Saffsanity/sill](https://github.com/Saffsanity/sill) v0.5.1 plus the changes in
+> [Intel and AMD Macs](#intel-and-amd-macs) below; the iPhone and iPad app is the
+> original's, unchanged. Not affiliated with or supported by the original author.
+
 Any window from your Mac, on your iPhone and iPad.
 
 Sill shows a window from your Mac, or the whole desktop, on your iPhone or
@@ -37,6 +42,44 @@ the App Store yet; until it is, you can build it from source (below).
 - Your Mac and your device on the same network, joined by a USB cable, or near
   each other with Direct Wireless Connection on. Away from home, your own VPN,
   such as Tailscale, with Remote Access on.
+
+## Intel and AMD Macs
+
+What this fork changes, and what has been tried:
+
+- **Hardware HEVC encoding works.** The hardware encoder on an Intel/AMD Mac holds
+  about six frames before it returns the first, and Sill keeps one frame inside the
+  encoder at a time, so upstream Sill never got a frame back and fell over to its
+  hang watchdog. On x86_64 Sill now completes each frame as it goes
+  (`VTCompressionSessionCompleteFrames`): every frame comes back, about 5 ms at
+  1080p30. Apple silicon is unchanged.
+- **An explicit software-encoder opt-in**, `--encoder-mode=software-requested` for
+  `SillHost` or `defaults write <bundle ID> encoderMode software-requested` for the
+  app, for Macs without a hardware HEVC encoder that also do not report which
+  encoder runs. It disables the hardware in the request, accepts an unreported
+  backend, and refuses one that says it is hardware. Slower (9–21 fps at 1080p).
+  `--encoder-mode=auto|hardware|software` choose the others; auto is the default.
+- **A local test app**, `Sill AMD Test.app` (bundle ID `local.sill.amd-test`), with
+  its own Keychain items and no update check, so it never touches an installed
+  Sill.app:
+
+  ```
+  SILL_SIGN_IDENTITY=- Scripts/make-app.sh --amd-test          # ad hoc
+  SILL_SIGN_IDENTITY="Sill Local Test Signing" Scripts/make-app.sh --amd-test
+  ```
+
+  Ad hoc builds lose Screen Recording, Accessibility and the Keychain's Always
+  Allow at every rebuild. Signing with a self-signed code-signing certificate named
+  `Sill Local Test Signing` in your login keychain keeps them across rebuilds.
+- **Check a Mac first:** `swift run -c release SillHost --encoder-selftest
+  --encoder-mode=auto` encodes and decodes 300 frames in a few seconds with no
+  permissions. `PASS` with `hardware=true` means streaming should work.
+
+Tried on one machine only: a Ryzen 5 5500 with a Radeon RX 6600 on macOS 26.5, with
+an iPad (9th generation) running Sill 0.5.1 from the App Store: the 1080p desktop
+on the hardware encoder, clicks, typing and Apple Pencil. Not tried on any Intel
+Mac. Known: the virtual display does not work on macOS 26.5 (a private macOS
+interface changed); real windows stream without it.
 
 ## How it works
 

@@ -78,13 +78,21 @@ enum StatusText {
                                    action: .allowAccessibility))
         }
         // Kept to one line no wider than the rest of the menu: a menu item's subtitle does not wrap.
-        if s.softwareEncoder, s.hardwareEncoderStuck {
+        if let problem = s.encoderProblem {
+            attention.append(.init(title: "Encoder Can’t Start", subtitle: problem, action: .none))
+        } else if s.softwareEncoder, s.encoderMode == .softwareRequested {
+            attention.append(.init(title: "Software Encoding Requested",
+                                   subtitle: "The Mac does not confirm which encoder runs; hardware probes are disabled.", action: .none))
+        } else if s.softwareEncoder, s.encoderMode == .software {
+            attention.append(.init(title: "Software Encoder Selected",
+                                   subtitle: "Hardware probes and automatic hardware return are disabled.", action: .none))
+        } else if s.softwareEncoder, s.hardwareEncoderStuck {
             attention.append(.init(title: "Hardware Encoder Stuck",
                                    subtitle: "Streaming with the software encoder, up to 60 fps. Restarting the Mac fixes this.",
                                    action: .none))
         } else if s.softwareEncoder {
-            attention.append(.init(title: "Hardware Encoder Busy",
-                                   subtitle: "Streaming with the software encoder, up to 60 fps, until it is free again.",
+            attention.append(.init(title: "Software Encoder",
+                                   subtitle: "VideoToolbox reports software encoding for the current stream.",
                                    action: .none))
         }
         let remotePortTaken = remotePortInUse(s.remote)

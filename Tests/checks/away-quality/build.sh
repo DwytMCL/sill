@@ -6,7 +6,7 @@
 ROOT=$1; OUT=$2; shift 2
 T=$(mktemp -d)
 cp "$ROOT/Sources/StreamProtocol/HostSettings.swift" "$T/"
-for f in HostConfig DeviceSettings AwayPolicy OriginPolicy; do
+for f in EncoderCapabilities HostConfig DeviceSettings AwayPolicy OriginPolicy; do
     sed '/^import StreamProtocol$/d' "$ROOT/Sources/SillHost/$f.swift" > "$T/$f.swift"
 done
 for o in "$@"; do

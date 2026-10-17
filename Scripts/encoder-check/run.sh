@@ -44,7 +44,7 @@ mutants)
   ;;
 probe)
   echo "== probe check"
-  swiftc -O -package-name sill $ROOT/Sources/SillHost/EncoderProbe.swift $ROOT/Sources/SillHost/Stats.swift \
+  swiftc -O -package-name sill $ROOT/Sources/SillHost/EncoderCapabilities.swift $ROOT/Sources/SillHost/EncoderProbe.swift $ROOT/Sources/SillHost/Stats.swift \
     $ROOT/Scripts/encoder-check/probe/main.swift -o $OUT/probe-check || { failed=1; continue }
   encoder_free $OUT/probe-check || { failed=1; continue }
   $OUT/probe-check || failed=1
@@ -55,8 +55,8 @@ encoder)
   # The real file, less the two imports FakeVT.swift stands in for; nothing else changes.
   src=$OUT/encoder-src; rm -rf $src; mkdir -p $src
   sed -e '/^import VideoToolbox$/d' -e '/^import StreamProtocol$/d' $ROOT/Sources/SillHost/HEVCEncoder.swift > $src/HEVCEncoder.swift
-  swiftc -O -module-name EncoderCheck $src/HEVCEncoder.swift $ROOT/Sources/SillHost/EncoderMailbox.swift \
-    $ROOT/Sources/SillHost/EncoderSlowState.swift \
+  swiftc -O -package-name sill -module-name EncoderCheck $src/HEVCEncoder.swift $ROOT/Sources/SillHost/EncoderMailbox.swift \
+    $ROOT/Sources/SillHost/EncoderSlowState.swift $ROOT/Sources/SillHost/EncoderCapabilities.swift \
     $ROOT/Sources/SillHost/EncoderProbe.swift $ROOT/Scripts/encoder-check/encoder/FakeVT.swift \
     $ROOT/Scripts/encoder-check/encoder/main.swift -o $OUT/encoder-check || { failed=1; continue }
   encoder_free $OUT/encoder-check || { failed=1; continue }

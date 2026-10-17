@@ -7,6 +7,9 @@ import CoreGraphics
 /// The coordinator takes a new value only between pipelines (inside `select`), so one pipeline
 /// never mixes two settings. See `StreamCoordinator.setTarget`.
 package struct HostConfig: Equatable, Sendable {
+    /// Startup-only local selection; a host restart is required to change it. Never a device
+    /// setting or a backend identity claim.
+    package var encoderMode: EncoderMode = .auto
     /// Ceiling for the stream rate; each device asks for its own panel's rate (60 until it does).
     package var maxFPS: Int
     /// 2 = Retina capture, 1 = points (much cheaper).
@@ -108,6 +111,7 @@ package struct HostConfig: Equatable, Sendable {
         func onOff(_ b: Bool) -> String { b ? "on" : "off" }
         func scaleName(_ s: CGFloat) -> String { s >= 1.5 ? "Retina" : "points" }
         var parts: [String] = []
+        if encoderMode != new.encoderMode { parts.append("encoder mode \(encoderMode.rawValue) → \(new.encoderMode.rawValue)") }
         if maxFPS != new.maxFPS { parts.append("frame rate limit \(maxFPS) → \(new.maxFPS) fps") }
         if bitrate != new.bitrate { parts.append("bitrate \(Self.mbps(bitrate)) → \(Self.mbps(new.bitrate)) Mbps per 60 fps") }
         if captureScale != new.captureScale { parts.append("\(scaleName(captureScale)) → \(scaleName(new.captureScale))") }

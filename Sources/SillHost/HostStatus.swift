@@ -110,6 +110,11 @@ package struct HostStatusSnapshot: Equatable {
     /// every stream until a re-check finds the hardware keeping up with the stream (every 30 s
     /// while a device is connected, backing off to 300 s), which clears it.
     package var softwareEncoder = false
+    package var encoderMode: EncoderMode = .auto
+    package var encoderCapabilities: EncoderCapabilities?
+    package var encoderProblem: String?
+    /// Unknown/readback failure never becomes a hardware claim.
+    package var hardwareEncoder: Bool { stream != nil && encoderCapabilities?.usingHardware == true }
     /// With `softwareEncoder`: so many checks have not got their frame back that the encoder is
     /// stuck, not busy, and the re-check has stopped probing it (a restart of the Mac fixes that).
     /// Cleared as soon as one of those frames comes back.
@@ -280,5 +285,14 @@ package final class HostStatus {
         var next = snapshot
         change(&next)
         if next != snapshot { snapshot = next; onChange?() }
+    }
+}
+
+// Status equality compares every encoder field, operation statuses included.
+extension EncoderCapabilities: Equatable {
+    package static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.requestedMode == rhs.requestedMode && lhs.usingHardware == rhs.usingHardware &&
+        lhs.encoderID == rhs.encoderID && lhs.gpuRegistryID == rhs.gpuRegistryID &&
+        lhs.propertyStatuses == rhs.propertyStatuses && lhs.probeOutcome == rhs.probeOutcome
     }
 }

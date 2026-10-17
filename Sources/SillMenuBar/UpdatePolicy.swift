@@ -294,6 +294,8 @@ enum UpdatePolicy {
         var canCheck = true
         /// Counts Check Now's results in this run: VoiceOver hears each new one.
         var resultID = 0
+        var automaticAvailable = true
+        var footnote = UpdatePolicy.footnote
     }
 
     static let notCheckedLine = "Not checked yet."

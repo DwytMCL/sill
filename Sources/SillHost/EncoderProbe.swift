@@ -62,30 +62,43 @@ enum EncoderProbe {
     /// True when a hardware session returns one 256×256 frame within `timeout`. The launch probe
     /// and the self-test: prints its one line and counts `enc.probeOK` or `enc.probeHung`.
     static func hardwareResponds(timeout: TimeInterval = 1.0) -> Bool {
+        probe(mode: .hardware, timeout: timeout).probeOutcome == .passed
+    }
+
+    /// Bounded one-frame diagnostic. Passing means output plus the requested selection policy,
+    /// not decode validation. Forced production software must skip probes entirely at the caller.
+    static func probe(mode: EncoderMode, timeout: TimeInterval = 1.0) -> EncoderCapabilities {
         let started = CFAbsoluteTimeGetCurrent()
         let done = DispatchSemaphore(value: 0)
-        guard let enc = try? HEVCEncoder(width: 256, height: 256, fps: 30, bitrate: 1_000_000, prioritizeSpeed: true) else {
-            return false   // no hardware session at all: the software encoder is the only option
+        let enc: HEVCEncoder
+        do {
+            enc = try HEVCEncoder(width: 256, height: 256, fps: 30, bitrate: 1_000_000,
+                                  prioritizeSpeed: true, mode: mode, quiet: true)
+        } catch {
+            var c = (error as? HEVCEncoder.EncoderError)?.capabilities ?? EncoderCapabilities(
+                requestedMode: mode, usingHardware: nil, encoderID: nil, gpuRegistryID: nil,
+                propertyStatuses: [:], probeOutcome: .failed)
+            if c.probeOutcome == .notRun { c.probeOutcome = .failed }
+            print("Encoder probe (requested \(mode.rawValue)): \(c.probeOutcome.rawValue); \(error)")
+            return c
+        }
+        var c = enc.capabilities
+        guard let pb = testFrame(width: 256, height: 256, bar: 0) else {
+            c.probeOutcome = .failed
+            print("Encoder probe: no pixel buffer; not tested")
+            return c
         }
         enc.onEncoded = { _, _, _ in done.signal() }
         enc.testHoldEachFrame = testHold
-        let attrs: [CFString: Any] = [kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                                      kCVPixelBufferWidthKey: 256, kCVPixelBufferHeightKey: 256,
-                                      kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary]
-        var pb: CVPixelBuffer?
-        CVPixelBufferCreate(nil, 256, 256, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, attrs as CFDictionary, &pb)
-        guard let pb else { return true }   // cannot test; assume healthy
-        CVPixelBufferLockBaseAddress(pb, [])
-        if let y = CVPixelBufferGetBaseAddressOfPlane(pb, 0) { memset(y, 128, CVPixelBufferGetBytesPerRowOfPlane(pb, 0) * 256) }
-        if let uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1) { memset(uv, 128, CVPixelBufferGetBytesPerRowOfPlane(pb, 1) * 128) }
-        CVPixelBufferUnlockBaseAddress(pb, [])
         enc.encode(pb, pts: CMTime(value: 0, timescale: 30))
         let ok = done.wait(timeout: .now() + timeout) == .success
         if !ok { giveUp(enc) }
+        c = enc.capabilities
+        c.probeOutcome = ok ? .passed : .timedOut
         Stats.shared.bump(ok ? "enc.probeOK" : "enc.probeHung")
-        print("Hardware encoder probe: \(ok ? "responding" : "no answer") after \(Int((CFAbsoluteTimeGetCurrent() - started) * 1000)) ms")
+        print("Encoder probe (requested \(mode.rawValue), hardware \(c.usingHardware.map(String.init) ?? "unknown")): \(c.probeOutcome.rawValue) after \(Int((CFAbsoluteTimeGetCurrent() - started) * 1000)) ms")
         withExtendedLifetime(enc) {}
-        return ok
+        return c
     }
 
     /// Whether the hardware keeps up with a stream of this size now: frames of a moving test
@@ -99,7 +112,7 @@ enum EncoderProbe {
     /// the encoder): drawing a frame costs milliseconds a stream never spends there (30 MB of fresh
     /// memory at Retina 6K), and inside the timing it counted against the engine. `ok` false: a
     /// frame took longer than `timeout` (it then counts as stuck until it comes back). `fps` nil:
-    /// nothing could be measured (no pixel buffers), so assume it keeps up. About 110 ms at
+    /// nothing could be measured (for example no pixel buffers); `ok` is false. About 110 ms at
     /// 3024×1904 when the engine is free (~120 fps; drawn inside the timing it measured ~115) and
     /// 290 ms at 6016×3384 (~39 fps; ~37); a starved engine shows as a low rate, not as no answer.
     /// Blocks the calling thread for up to (`frames` + 3) × `timeout`: never call it on the main
@@ -108,8 +121,8 @@ enum EncoderProbe {
         let drawn = (0..<3).compactMap { testFrame(width: width, height: height, bar: $0) }
         let started = CFAbsoluteTimeGetCurrent()
         func elapsed() -> Int { Int((CFAbsoluteTimeGetCurrent() - started) * 1000) }
-        guard drawn.count == 3 else { return (true, nil, elapsed()) }
-        guard let enc = try? HEVCEncoder(width: width, height: height, fps: 60, bitrate: 15_000_000, prioritizeSpeed: false, quiet: true) else {
+        guard drawn.count == 3 else { return (false, nil, elapsed()) }
+        guard let enc = try? HEVCEncoder(width: width, height: height, fps: 60, bitrate: 15_000_000, prioritizeSpeed: false, mode: .hardware, quiet: true) else {
             return (false, nil, elapsed())
         }
         let done = DispatchSemaphore(value: 0)
@@ -137,7 +150,7 @@ enum EncoderProbe {
         var pb: CVPixelBuffer?
         CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, attrs as CFDictionary, &pb)
         guard let pb else { return nil }
-        CVPixelBufferLockBaseAddress(pb, [])
+        guard CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return nil }
         if let y = CVPixelBufferGetBaseAddressOfPlane(pb, 0) {
             let stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0), rows = CVPixelBufferGetHeightOfPlane(pb, 0)
             memset(y, 96, stride * rows)

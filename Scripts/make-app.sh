@@ -2,6 +2,8 @@
 # Builds Sill.app, the menu bar Mac host, from this SwiftPM package.
 #
 #   Scripts/make-app.sh                    .build/Sill.app, signed with your Apple Development identity
+#   SILL_SIGN_IDENTITY=- Scripts/make-app.sh --amd-test
+#                                          .build/Sill AMD Test.app, local x86_64 staging only
 #   Scripts/make-app.sh --install          …then replace /Applications/Sill.app (a running copy quits first)
 #   Scripts/make-app.sh --install --open   …and launch it: Noah's one command after any change
 #   SILL_SIGN_IDENTITY='Developer ID Application: … (9B2KKVM937)' Scripts/make-app.sh --release
@@ -22,15 +24,26 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-install=0; open_app=0; release=0
+install=0; open_app=0; release=0; amd_test=0
 for arg in "$@"; do
     case "$arg" in
         --install) install=1 ;;
         --open) open_app=1 ;;
         --release) release=1 ;;
-        *) echo "usage: $0 [--install] [--open] [--release]" >&2; exit 2 ;;
+        --amd-test) amd_test=1 ;;
+        *) echo "usage: $0 [--install] [--open] [--release] | --amd-test" >&2; exit 2 ;;
     esac
 done
+# This identity selects the test bundle's own Keychain items and turns off the update check.
+# Keep the test mode staging-only, with no upstream profile, signed ad hoc or with the local
+# self-signed "Sill Local Test Signing" identity, whose designated requirement survives a rebuild
+# (so Screen Recording, Accessibility and the keychain's Always Allow are granted once).
+if [ "$amd_test" = 1 ] && { [ "$install" = 1 ] || [ "$open_app" = 1 ] || [ "$release" = 1 ] \
+    || { [ "${SILL_SIGN_IDENTITY:-}" != - ] && [ "${SILL_SIGN_IDENTITY:-}" != "Sill Local Test Signing" ]; } \
+    || [ -n "${SILL_PROVISION_PROFILE:-}" ]; }; then
+    echo "error: --amd-test requires SILL_SIGN_IDENTITY=- or 'Sill Local Test Signing', no provisioning profile, and no install/open/release flags." >&2
+    exit 2
+fi
 # --release is for notarization, which accepts only a Developer ID Application signature and says
 # so only after the upload. The default identity is Apple Development, so without
 # SILL_SIGN_IDENTITY stop now, before building; the signature itself is checked after signing.
@@ -58,10 +71,13 @@ fi
 
 bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' Packaging/Info.plist)"
 
-swift build -c release --product SillMenuBar
-bin="$(swift build -c release --product SillMenuBar --show-bin-path)"
+build_args=(-c release --product SillMenuBar)
+if [ "$amd_test" = 1 ]; then build_args+=(--build-system native --arch x86_64 -j 2); fi
+swift build "${build_args[@]}"
+bin="$(swift build "${build_args[@]}" --show-bin-path)"
 app=.build/Sill.app
-stage=.build/Sill.app.partial      # assembled aside, so a failed run never leaves half a bundle
+if [ "$amd_test" = 1 ]; then app='.build/Sill AMD Test.app'; fi
+stage="$app.partial"              # assembled aside, so a failed run never leaves half a bundle
 rm -rf "$stage"
 mkdir -p "$stage/Contents/MacOS" "$stage/Contents/Resources"
 # The executable, with the SDK it was compiled against recorded in it. SwiftPM links without
@@ -75,6 +91,16 @@ xcrun vtool -set-build-version macos "${minos:?vtool reported no deployment targ
 cp Packaging/Info.plist "$stage/Contents/Info.plist"
 build_number="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $build_number" "$stage/Contents/Info.plist"
+if [ "$amd_test" = 1 ]; then
+    bundle_id=local.sill.amd-test
+    /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $bundle_id" "$stage/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Sill AMD Test' "$stage/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleName Sill AMD Test' "$stage/Contents/Info.plist"
+    cp LICENSE "$stage/Contents/Resources/LICENSE"
+    cp docs/packaging-amd-test.md "$stage/Contents/Resources/PORT-CHANGES.md"
+    archs="$(lipo -archs "$stage/Contents/MacOS/Sill")"
+    [ "$archs" = x86_64 ] || { echo "error: expected x86_64, got $archs" >&2; exit 1; }
+fi
 printf 'APPL????' > "$stage/Contents/PkgInfo"
 
 # The icon. design/AppIcon.svg is the iOS art, a full-bleed square. macOS 26+ masks and lights a

@@ -28,6 +28,7 @@ build() {   # NAME TREE
   local extra=()
   [[ -f $tree/Sources/SillHost/EncoderMailbox.swift ]] && extra+=($tree/Sources/SillHost/EncoderMailbox.swift)
   [[ -f $tree/Sources/SillHost/EncoderSlowState.swift ]] && extra+=($tree/Sources/SillHost/EncoderSlowState.swift)
+  [[ -f $tree/Sources/SillHost/EncoderCapabilities.swift ]] && extra+=($tree/Sources/SillHost/EncoderCapabilities.swift)
   swiftc -O -package-name sill -module-name Harness -o $OUT/harness-$name \
     $ROOT/Scripts/encoder-check/harness/main.swift $d/HEVCEncoder.swift $tree/Sources/SillHost/EncoderProbe.swift \
     $tree/Sources/SillHost/Stats.swift $tree/Sources/StreamProtocol/*.swift $extra

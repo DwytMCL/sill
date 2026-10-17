@@ -192,6 +192,7 @@ struct UpdatesSection: View {
     var body: some View {
         Section {
             Toggle("Check for updates automatically", isOn: $automatic)
+                .disabled(!pane.automaticAvailable)
             LabeledContent {
                 HStack(spacing: 8) {
                     if let url = pane.releasePage {
@@ -210,7 +211,7 @@ struct UpdatesSection: View {
                 AccessibilityNotification.Announcement(pane.line).post()
             }
         } footer: {
-            Footnote(UpdatePolicy.footnote)
+            Footnote(pane.footnote)
         }
     }
 }
@@ -268,9 +269,13 @@ private struct StreamingPane: View {
             }
             if let snapshot = model.coordinator?.status.snapshot, snapshot.softwareEncoder {
                 Section {
-                    Label(snapshot.hardwareEncoderStuck
+                    Label(snapshot.encoderMode == .softwareRequested
+                          ? "Software encoding is requested. This Mac does not confirm which encoder runs; hardware probes and automatic hardware return are disabled."
+                          : snapshot.encoderMode == .software
+                          ? "Software encoding is selected. Hardware probes and automatic hardware return are disabled."
+                          : snapshot.hardwareEncoderStuck
                           ? "The hardware encoder is stuck, so streams use the software encoder: up to 60 fps at Standard resolution. Restarting the Mac fixes this."
-                          : "The hardware encoder is busy or not answering, so streams use the software encoder: up to 60 fps at Standard resolution. Sill switches back by itself once it keeps up again.",
+                          : "VideoToolbox reports software encoding for the current stream. Hardware use is shown only when session readback confirms it.",
                           systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
                 }

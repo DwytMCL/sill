@@ -74,6 +74,85 @@ func feed(_ enc: HEVCEncoder, count: Int, fps: Double = 60, from: Int = 0, captu
     return start
 }
 
+// C1: session policy and diagnostics, using the real factory with no VT symbols linked.
+if !onlyE7 {
+    func explicit(_ mode: EncoderMode) throws -> HEVCEncoder {
+        try HEVCEncoder(width: 16, height: 16, fps: 30, bitrate: 1_000_000, prioritizeSpeed: false, mode: mode, quiet: true)
+    }
+    func rejected(_ mode: EncoderMode, _ verify: (HEVCEncoder.EncoderError) -> Bool) {
+        do { _ = try explicit(mode); expect(false, "\(mode) unexpectedly accepted") }
+        catch let error as HEVCEncoder.EncoderError { expect(verify(error), "unexpected rejection: \(error)") }
+        catch { expect(false, "wrong error: \(error)") }
+    }
+    FakeVT.reset()
+    do {
+        let enc = try explicit(.hardware), c = enc.capabilities
+        expect(c.requestedMode == .hardware && c.usingHardware == true && c.probeOutcome == .notRun, "prepared hardware snapshot")
+        expect(c.encoderID == "fake.encoder" && c.gpuRegistryID == 42, "read IDs")
+        expect(FakeVT.specifications.last?[kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String] as? Bool == true, "hardware not required in spec")
+        expect(c.propertyStatuses["prepare"] == 0 && c.propertyStatuses["copy.UsingHardwareAcceleratedVideoEncoder"] == 0, "missing operation status")
+    } catch { expect(false, "strict hardware: \(error)") }
+    FakeVT.reset(); FakeVT.forcedReadback = false
+    rejected(.hardware) { $0.capabilities?.probeOutcome == .unsupported && $0.capabilities?.usingHardware == false }
+    FakeVT.reset(); FakeVT.readHardware = false
+    rejected(.hardware) { $0.capabilities?.usingHardware == nil }
+    rejected(.software) { $0.capabilities?.usingHardware == nil }
+    do {
+        let enc = try explicit(.auto)
+        expect(enc.capabilities.usingHardware == nil, "auto unknown became hardware")
+    } catch { expect(false, "auto unknown must remain usable: \(error)") }
+    FakeVT.reset(); FakeVT.forcedReadback = true
+    rejected(.software) { $0.capabilities?.probeOutcome == .unsupported }
+    FakeVT.reset()
+    do {
+        let before = FakeVT.lastSession
+        let enc = try explicit(.software)
+        expect(enc.capabilities.usingHardware == false && enc.software, "software readback")
+        expect(FakeVT.lastSession == before + 1 && FakeVT.specifications.count == 1, "software created extra probe/session")
+        expect(FakeVT.specifications[0][kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder as String] as? Bool == false, "software not prohibited in spec")
+    } catch { expect(false, "software: \(error)") }
+    FakeVT.reset(); FakeVT.forcedReadback = false
+    do { let enc = try explicit(.auto); expect(enc.software && enc.capabilities.usingHardware == false, "auto CPU misclassified") }
+    catch { expect(false, "auto CPU: \(error)") }
+    FakeVT.reset(); FakeVT.setStatuses["AllowFrameReordering"] = -12900
+    rejected(.auto) { $0.capabilities?.propertyStatuses["set.AllowFrameReordering"] == -12900 && $0.capabilities?.probeOutcome == .failed }
+    FakeVT.reset(); FakeVT.prepareStatus = -12902
+    rejected(.auto) { $0.capabilities?.propertyStatuses["prepare"] == -12902 }
+    FakeVT.reset(); FakeVT.createStatus = kVTCouldNotFindVideoEncoderErr
+    rejected(.hardware) { $0.capabilities?.propertyStatuses["create"] == kVTCouldNotFindVideoEncoderErr && $0.capabilities?.probeOutcome == .unsupported }
+    let probe = EncoderProbe.probe(mode: .hardware)
+    expect(probe.probeOutcome == .unsupported && probe.usingHardware == nil, "probe hid creation failure")
+    FakeVT.reset(); FakeVT.copyStatuses["UsingHardwareAcceleratedVideoEncoder"] = -12900
+    rejected(.hardware) { $0.capabilities?.propertyStatuses["copy.UsingHardwareAcceleratedVideoEncoder"] == -12900 && $0.capabilities?.usingHardware == nil }
+    FakeVT.reset(); FakeVT.setStatuses["DataRateLimits"] = -12900
+    FakeVT.copyStatuses["EncoderID"] = -12900; FakeVT.copyStatuses["UsingGPURegistryID"] = -12900
+    do {
+        let c = try explicit(.auto).capabilities
+        expect(c.propertyStatuses["set.DataRateLimits"] == -12900 && c.usingHardware == true, "optional tuning lost failure")
+        expect(c.encoderID == nil && c.gpuRegistryID == nil, "unavailable IDs invented")
+    } catch { expect(false, "optional property failure must stay diagnostic: \(error)") }
+    FakeVT.reset()
+    do {
+        _ = try HEVCEncoder(width: 16, height: 15, fps: 30, bitrate: 1_000_000, prioritizeSpeed: false, mode: .auto)
+        expect(false, "odd size accepted")
+    } catch { expect(FakeVT.specifications.isEmpty, "invalid size reached VT") }
+    FakeVT.reset(); FakeVT.pixelBufferFailure = true
+    let allocation = EncoderProbe.probe(mode: .hardware)
+    expect(allocation.probeOutcome == .failed && FakeVT.calls.isEmpty, "unallocated probe reported healthy")
+    expect(!EncoderProbe.throughput(width: 16, height: 16).ok, "unallocated throughput reported healthy")
+    FakeVT.reset(); FakeVT.readHardware = false
+    expect(!EncoderProbe.hardwareResponds() && FakeVT.calls.isEmpty, "unverified hardware reached encode/probe pass")
+    FakeVT.reset(plan: { _, _, _, _ in .refuse(after: 0) })
+    do {
+        let enc = try explicit(.software)
+        enc.encode(makeFrame(seq: 900), pts: .zero)
+        Thread.sleep(forTimeInterval: 0.05)
+        expect(enc.capabilities.propertyStatuses["encode.submit"] == -12902, "encode refusal status lost")
+    } catch { expect(false, "refusal setup: \(error)") }
+    FakeVT.reset()
+    print("C1: selection/readback/required and optional statuses checked")
+}
+
 // E1: every kind of session (a stream's on the hardware, a probe's, the software encoder's) lets
 // one frame in at a time, and none prints anything when it is made.
 if !onlyE7 {

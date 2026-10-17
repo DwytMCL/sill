@@ -97,6 +97,12 @@ final class AppModel {
                 // unavailable, not the app (docs/home-pairing-plan.md §6.1).
                 let remote = makeRemoteAccess()
                 settings.config.requirePairing = launchRequirePairing(remote)
+                // Startup-only, never written by Sill: `defaults write <bundle ID> encoderMode
+                // software-requested`, or `-encoderMode software-requested` for one launch.
+                if let raw = UserDefaults.standard.string(forKey: "encoderMode") {
+                    if let mode = EncoderMode(rawValue: raw) { settings.config.encoderMode = mode }
+                    else { print("encoderMode \(raw) ignored: use auto, hardware, software or software-requested.") }
+                }
                 // The window lists carry this Sill's version, when it has one (the bare binary's
                 // "dev" does not parse): later devices can tell which Mac to update.
                 let c = try StreamCoordinator(config: settings.config, synthetic: synthetic, appKitLoop: true, remote: remote,
@@ -176,6 +182,7 @@ final class AppModel {
     /// only for a test host and otherwise ignored with a line, as before.
     private func makeIdentityStore() -> IdentityStore {
         let dir = ProcessInfo.processInfo.environment["SILL_TEST_REMOTE_DIR"].flatMap { $0.isEmpty ? nil : $0 }
+        let service = IdentityStorePlan.keychainService(bundleIdentifier: Bundle.main.bundleIdentifier)
         let choice = IdentityStorePlan.choose(bundled: Self.bundled, synthetic: synthetic,
                                               entitledAccessGroup: Self.entitledKeychainAccessGroup(), testRemoteDir: dir)
         if dir != nil, case .testDirectory = choice {} else if dir != nil {
@@ -186,13 +193,13 @@ final class AppModel {
             // The strong keychain: no other process can pre-create or read these items. Logged so a
             // release build can be confirmed hardened (and Noah's on-device pass can read it back).
             print("Remote access: the identity is in the data-protection keychain (access group \(group)).")
-            return KeychainIdentityStore(accessGroup: group)
+            return KeychainIdentityStore(accessGroup: group, service: service)
         case .legacy:
             // No keychain-access-groups entitlement (a development build, or a release with no
             // embedded provisioning profile): the login keychain, the profile-free fallback. Said in
             // the log so a build that should have hardened but did not is visible.
             print("Remote access: the identity is in the login keychain (no keychain-access-groups entitlement — a development build, or a release with no embedded provisioning profile; docs/keychain-plan.md).")
-            return KeychainIdentityStore()
+            return KeychainIdentityStore(service: service)
         case .memory:
             return MemoryIdentityStore()
         case .testDirectory(let path):

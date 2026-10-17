@@ -28,6 +28,9 @@ import StreamProtocol
 final class UpdateChecker {
     /// Where and when it checks: GitHub and the plan's schedule, or a test's (DebugHooks).
     struct Configuration {
+        /// Upstream releases contain ARM-only artifacts; this local test bundle has no update feed.
+        /// Bundle-derived, independent of user defaults and debug feed/version overrides.
+        var portTestBundle = Bundle.main.bundleIdentifier == "local.sill.amd-test"
         /// The releases feed.
         var feed = UpdatePolicy.feed
         /// A feed on this Mac (`-SillUpdateFeed`): any http or https release page counts, and test
@@ -106,21 +109,26 @@ final class UpdateChecker {
         session = URLSession(configuration: c)
     }
 
-    /// Whether this build can check at all: it has a version, and it is not in test pattern mode
-    /// without a test feed.
-    var canCheck: Bool { running != nil && !testPatternOnly }
+    /// Whether this build can check: a version, permitted feed, and no local port test identity.
+    var canCheck: Bool { !configuration.portTestBundle && running != nil && !testPatternOnly }
     private var testPatternOnly: Bool { configuration.testPattern && !configuration.testFeed }
 
     /// The stored release, when it is newer than what runs.
     var offer: UpdatePolicy.Offer? {
-        UpdatePolicy.offer(stored: stored, running: running, anyReleaseURL: configuration.testFeed)
+        guard !configuration.portTestBundle else { return nil }
+        return UpdatePolicy.offer(stored: stored, running: running, anyReleaseURL: configuration.testFeed)
     }
 
     /// Settings › General's line and buttons.
     var pane: UpdatePolicy.Pane {
-        UpdatePolicy.pane(checking: phase == .checking, result: result, resultID: resultCount, offer: offer,
-                          lastCheck: stored.lastCheck, hasVersion: running != nil, testPatternOnly: testPatternOnly,
-                          time: Self.time, date: Self.date)
+        if configuration.portTestBundle {
+            return UpdatePolicy.Pane(line: "Sill AMD Test has no update channel.", canCheck: false,
+                                     automaticAvailable: false,
+                                     footnote: "Use a separately verified x86_64 test build. Upstream downloads are for Apple silicon.")
+        }
+        return UpdatePolicy.pane(checking: phase == .checking, result: result, resultID: resultCount, offer: offer,
+                                 lastCheck: stored.lastCheck, hasVersion: running != nil, testPatternOnly: testPatternOnly,
+                                 time: Self.time, date: Self.date)
     }
 
     /// The running version as SillVersion shows it ("0.3"), for the menu's subtitle.

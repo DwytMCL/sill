@@ -1,0 +1,9 @@
+Sources/StreamProtocol/*.swift
+Sources/SillHost/OriginPolicy.swift
+Sources/SillHost/CableLink.swift
+Sources/SillHost/HostIdentity.swift
+Sources/SillHost/KeychainIdentityStore.swift
+Sources/SillMenuBar/IdentityStorePlan.swift
+Sources/SillMenuBar/UpdatePolicy.swift
+Sources/SillMenuBar/UpdateChecker.swift
+flags: -package-name sill

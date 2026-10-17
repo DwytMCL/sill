@@ -1,0 +1,10 @@
+Sources/StreamProtocol/*.swift
+Sources/SillHost/EncoderCapabilities.swift
+Sources/SillHost/EncoderSelectionPolicy.swift
+Sources/SillHost/HostConfig.swift
+Sources/SillHost/ClientLink.swift
+Sources/SillHost/OriginPolicy.swift
+Sources/SillHost/CableLink.swift
+Sources/SillHost/HostIdentity.swift
+Sources/SillHost/HostStatus.swift
+flags: -package-name sill

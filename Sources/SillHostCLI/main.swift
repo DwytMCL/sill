@@ -12,6 +12,12 @@ setvbuf(stdout, nil, _IOLBF, 0)
 // Sources/SillHost/HostConfig.swift now (`HostConfig.standard`), which is also where the menu bar
 // app's Settings start. Change, rebuild, measure.
 var config = HostConfig.standard
+let requestedEncoderMode: EncoderMode?
+do {
+    requestedEncoderMode = try EncoderSelectionPolicy.requestedMode(arguments: CommandLine.arguments)
+    config.encoderMode = requestedEncoderMode ?? .auto
+}
+catch { print(error.localizedDescription); exit(2) }
 
 // Optional. Streams the first window whose app name or title matches, before any client asks.
 // Normally left off: the client picks a window from its bar.
@@ -87,7 +93,7 @@ if CommandLine.arguments.contains("--print-cable") {
 // HEVCEncoder (hardware, then software) and reports what came back, so the watchdog and the
 // fallback can be exercised without Screen Recording. Exits when done.
 if CommandLine.arguments.contains("--encoder-selftest") {
-    EncoderSelfTest.run()
+    EncoderSelfTest.run(mode: requestedEncoderMode)
 }
 
 // `SillHost --menu-selftest[=APP]`: the menus a device would be sent for APP (a pid, or the start of
